@@ -18,6 +18,9 @@ app.use(cors());
 app.use(express.json());
 app.use(morgan('dev'));
 
+// Serve static files
+app.use(express.static(path.join(__dirname, 'public')));
+
 // Database connection
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('MongoDB connected'))
@@ -127,15 +130,6 @@ const TechnologySchema = new mongoose.Schema({
   additionalInfo: {
     type: String
   }
-});
-
-// Create index for text search
-TechnologySchema.index({
-  title: 'text',
-  description: 'text',
-  detailedInformation: 'text',
-  tags: 'text',
-  'submitter.organization': 'text'
 });
 
 const Technology = mongoose.model('Technology', TechnologySchema);
@@ -315,27 +309,21 @@ app.get('/api/technologies', async (req, res) => {
     const skip = (page - 1) * limit;
     
     // Build query
-    const query = { status: 'published' };
+    let query = {};
+    
+    // For public access, only show published technologies
+    if (!req.headers.authorization) {
+      query.status = 'published';
+    }
     
     // Add service area filter if provided
     if (req.query.serviceAreaId) {
       query.serviceAreaId = req.query.serviceAreaId;
     }
     
-    // Add featured filter if requested
-    if (req.query.featured === 'true') {
-      // For featured, just use most recent
-      limit_val = parseInt(req.query.limit) || 4;
-    }
-    
-    // Add text search if provided
-    if (req.query.search) {
-      query.$text = { $search: req.query.search };
-    }
-    
     // Execute query with pagination
     const technologies = await Technology.find(query)
-      .sort({ publicationDate: -1 })
+      .sort({ publicationDate: -1, submissionDate: -1 })
       .skip(skip)
       .limit(limit)
       .populate('serviceAreaId', 'name');
@@ -371,351 +359,16 @@ app.get('/api/technologies/:id', async (req, res) => {
   }
 });
 
-// Suggestions route
-app.post('/api/suggestions', async (req, res) => {
-  try {
-    const {
-      title,
-      description,
-      serviceAreaId,
-      externalLink,
-      submitterName,
-      submitterEmail,
-      submitterOrganization,
-      additionalInfo
-    } = req.body;
-    
-    // Create new technology
-    const technology = new Technology({
-      title,
-      description,
-      serviceAreaId,
-      status: 'submitted',
-      externalLinks: externalLink ? [{ title: 'External Link', url: externalLink }] : [],
-      submitter: {
-        name: submitterName,
-        email: submitterEmail,
-        organization: submitterOrganization
-      },
-      additionalInfo
-    });
-    
-    await technology.save();
-    
-    res.status(201).json({ message: 'Technology suggestion submitted successfully' });
-  } catch (error) {
-    console.error('Submit suggestion error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Evaluations routes
-app.get('/api/evaluations/pending', protect, authorize('evaluator', 'administrator'), async (req, res) => {
-  try {
-    // Get technologies that:
-    // 1. Are in 'submitted' or 'under-review' status
-    // 2. Match the evaluator's service areas
-    // 3. Have not been evaluated by this evaluator
-    
-    // Find technologies in relevant service areas
-    const serviceAreaIds = req.user.serviceAreaAssignments;
-    
-    // Find technologies with the right status and service area
-    const technologies = await Technology.find({
-      status: { $in: ['submitted', 'under-review'] },
-      serviceAreaId: { $in: serviceAreaIds }
-    }).populate('serviceAreaId', 'name');
-    
-    // Filter out technologies already evaluated by this user
-    const evaluatedTechIds = await Evaluation.find({ 
-      evaluatorId: req.user._id 
-    }).distinct('technologyId');
-    
-    // Filter out already evaluated technologies
-    const pendingTechnologies = technologies.filter(
-      tech => !evaluatedTechIds.includes(tech._id.toString())
-    );
-    
-    res.json(pendingTechnologies);
-  } catch (error) {
-    console.error('Get pending evaluations error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-app.get('/api/evaluations/completed', protect, authorize('evaluator', 'administrator'), async (req, res) => {
-  try {
-    const evaluations = await Evaluation.find({ 
-      evaluatorId: req.user._id 
-    }).populate({
-      path: 'technologyId',
-      select: 'title status serviceAreaId submissionDate publicationDate',
-      populate: {
-        path: 'serviceAreaId',
-        select: 'name'
-      }
-    }).sort({ date: -1 });
-    
-    res.json(evaluations);
-  } catch (error) {
-    console.error('Get completed evaluations error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-app.get('/api/evaluations/technology/:id', protect, authorize('evaluator', 'administrator'), async (req, res) => {
-  try {
-    const evaluation = await Evaluation.findOne({
-      technologyId: req.params.id,
-      evaluatorId: req.user._id
-    });
-    
-    if (!evaluation) {
-      return res.status(404).json({ message: 'Evaluation not found' });
-    }
-    
-    res.json(evaluation);
-  } catch (error) {
-    console.error('Get evaluation error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-app.post('/api/evaluations/:id', protect, authorize('evaluator', 'administrator'), async (req, res) => {
-  try {
-    const { checklistResults, comments, recommendation } = req.body;
-    
-    // Check if technology exists
-    const technology = await Technology.findById(req.params.id);
-    
-    if (!technology) {
-      return res.status(404).json({ message: 'Technology not found' });
-    }
-    
-    // Check if user is assigned to this service area
-    if (!req.user.serviceAreaAssignments.includes(technology.serviceAreaId.toString())) {
-      return res.status(403).json({ message: 'Not authorized to evaluate this technology' });
-    }
-    
-    // Check if already evaluated
-    const existingEvaluation = await Evaluation.findOne({
-      technologyId: req.params.id,
-      evaluatorId: req.user._id
-    });
-    
-    if (existingEvaluation) {
-      return res.status(400).json({ message: 'You have already evaluated this technology' });
-    }
-    
-    // Create new evaluation
-    const evaluation = new Evaluation({
-      technologyId: req.params.id,
-      evaluatorId: req.user._id,
-      checklistResults,
-      comments,
-      recommendation
-    });
-    
-    await evaluation.save();
-    
-    // Update technology status to under-review if it was submitted
-    if (technology.status === 'submitted') {
-      technology.status = 'under-review';
-      await technology.save();
-    }
-    
-    res.status(201).json({ message: 'Evaluation submitted successfully' });
-  } catch (error) {
-    console.error('Submit evaluation error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Admin routes
-app.get('/api/admin/technologies', protect, authorize('administrator'), async (req, res) => {
-  try {
-    const technologies = await Technology.find()
-      .sort({ submissionDate: -1 })
-      .populate('serviceAreaId', 'name');
-    
-    res.json(technologies);
-  } catch (error) {
-    console.error('Admin get technologies error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-app.post('/api/admin/technologies', protect, authorize('administrator'), async (req, res) => {
-  try {
-    const technology = new Technology(req.body);
-    await technology.save();
-    
-    res.status(201).json(technology);
-  } catch (error) {
-    console.error('Admin create technology error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-app.put('/api/admin/technologies/:id', protect, authorize('administrator'), async (req, res) => {
-  try {
-    const technology = await Technology.findByIdAndUpdate(
-      req.params.id,
-      req.body,
-      { new: true, runValidators: true }
-    );
-    
-    if (!technology) {
-      return res.status(404).json({ message: 'Technology not found' });
-    }
-    
-    res.json(technology);
-  } catch (error) {
-    console.error('Admin update technology error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-app.post('/api/admin/technologies/:id/publish', protect, authorize('administrator'), async (req, res) => {
-  try {
-    const technology = await Technology.findById(req.params.id);
-    
-    if (!technology) {
-      return res.status(404).json({ message: 'Technology not found' });
-    }
-    
-    technology.status = 'published';
-    technology.publicationDate = new Date();
-    await technology.save();
-    
-    res.json(technology);
-  } catch (error) {
-    console.error('Admin publish technology error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-app.get('/api/admin/users', protect, authorize('administrator'), async (req, res) => {
-  try {
-    const users = await User.find()
-      .select('-password')
-      .sort({ name: 1 });
-    
-    res.json(users);
-  } catch (error) {
-    console.error('Admin get users error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-app.get('/api/admin/users/:id', protect, authorize('administrator'), async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id).select('-password');
-    
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-    
-    res.json(user);
-  } catch (error) {
-    console.error('Admin get user error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-app.post('/api/admin/users', protect, authorize('administrator'), async (req, res) => {
-  try {
-    const { email } = req.body;
-    
-    // Check if user exists
-    const userExists = await User.findOne({ email });
-    
-    if (userExists) {
-      return res.status(400).json({ message: 'User already exists' });
-    }
-    
-    const user = new User(req.body);
-    await user.save();
-    
-    // Remove password from response
-    const userResponse = user.toObject();
-    delete userResponse.password;
-    
-    res.status(201).json(userResponse);
-  } catch (error) {
-    console.error('Admin create user error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-app.put('/api/admin/users/:id', protect, authorize('administrator'), async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id);
-    
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-    
-    // Update fields
-    const { name, email, role, serviceAreaAssignments, password } = req.body;
-    
-    if (name) user.name = name;
-    if (email) user.email = email;
-    if (role) user.role = role;
-    if (serviceAreaAssignments) user.serviceAreaAssignments = serviceAreaAssignments;
-    
-    // Only update password if provided
-    if (password) {
-      user.password = password;
-    }
-    
-    await user.save();
-    
-    // Remove password from response
-    const userResponse = user.toObject();
-    delete userResponse.password;
-    
-    res.json(userResponse);
-  } catch (error) {
-    console.error('Admin update user error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-app.delete('/api/admin/users/:id', protect, authorize('administrator'), async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id);
-    
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-    
-    // Don't allow deleting the last admin
-    if (user.role === 'administrator') {
-      const adminCount = await User.countDocuments({ role: 'administrator' });
-      
-      if (adminCount <= 1) {
-        return res.status(400).json({ message: 'Cannot delete the last administrator' });
-      }
-    }
-    
-    await user.deleteOne();
-    
-    res.json({ message: 'User deleted successfully' });
-  } catch (error) {
-    console.error('Admin delete user error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// API endpoint to seed initial data - only for development and testing
+// API endpoint to seed initial data
 app.post('/api/seed', async (req, res) => {
-  if (process.env.NODE_ENV === 'production') {
-    return res.status(403).json({ message: 'Seed endpoint is not available in production' });
-  }
-  
   try {
-    // Define service areas
+    // Clear existing data
+    await User.deleteMany({});
+    await ServiceArea.deleteMany({});
+    await Technology.deleteMany({});
+    await Evaluation.deleteMany({});
+    
+    // Create service areas
     const serviceAreas = [
       { name: 'Bridge Management Systems', description: 'Systems for managing bridge assets and data' },
       { name: 'Condition Assessment/Monitoring', description: 'Technologies for assessing and monitoring bridge conditions' },
@@ -730,29 +383,47 @@ app.post('/api/seed', async (req, res) => {
       { name: 'Safety', description: 'Technologies improving bridge safety' }
     ];
     
-    // Create admin user
-    const adminExists = await User.findOne({ email: 'admin@abtc.org' });
-    if (!adminExists) {
-      await User.create({
-        name: 'Admin User',
-        email: 'admin@abtc.org',
-        password: 'AdminPass123',
-        role: 'administrator'
-      });
-    }
-    
-    // Create service areas
-    await ServiceArea.deleteMany({});
     const createdServiceAreas = await ServiceArea.insertMany(serviceAreas);
     
-    // Create sample technology
+    // Map service area names to their IDs
     const serviceAreaMap = {};
     createdServiceAreas.forEach(area => {
       serviceAreaMap[area.name] = area._id;
     });
     
-    await Technology.deleteMany({});
-    await Technology.create({
+    // Create admin user
+    const adminUser = await User.create({
+      name: 'Admin User',
+      email: 'admin@abtc.org',
+      password: 'AdminPass123',
+      role: 'administrator'
+    });
+    
+    // Create evaluator users
+    const evaluator1 = await User.create({
+      name: 'Evaluator 1',
+      email: 'evaluator1@abtc.org',
+      password: 'EvalPass123',
+      role: 'evaluator',
+      serviceAreaAssignments: [
+        serviceAreaMap['Materials'],
+        serviceAreaMap['Construction']
+      ]
+    });
+    
+    const evaluator2 = await User.create({
+      name: 'Evaluator 2',
+      email: 'evaluator2@abtc.org',
+      password: 'EvalPass123',
+      role: 'evaluator',
+      serviceAreaAssignments: [
+        serviceAreaMap['Condition Assessment/Monitoring']
+      ]
+    });
+    
+    // Create sample technologies
+    // Published technologies
+    const technology1 = await Technology.create({
       title: 'Fiber Optic Sensor Networks',
       description: 'Advanced monitoring system using fiber optic sensors to monitor structural health in real-time.',
       detailedInformation: '# Fiber Optic Sensor Networks\n\nFiber optic sensor networks represent a significant advancement in bridge monitoring technology.',
@@ -774,43 +445,268 @@ app.post('/api/seed', async (req, res) => {
       }
     });
     
-    // Create evaluator
-    const evaluatorExists = await User.findOne({ email: 'evaluator@abtc.org' });
-    if (!evaluatorExists) {
-      await User.create({
-        name: 'Evaluator User',
-        email: 'evaluator@abtc.org',
-        password: 'EvalPass123',
-        role: 'evaluator',
-        serviceAreaAssignments: [
-          serviceAreaMap['Condition Assessment/Monitoring'],
-          serviceAreaMap['Materials']
-        ]
-      });
-    }
+    const technology2 = await Technology.create({
+      title: 'Ultra-High Performance Concrete',
+      description: 'Advanced cementitious material with superior strength, durability, and versatility for bridge applications.',
+      detailedInformation: '# Ultra-High Performance Concrete\n\nUHPC is a revolutionary material with exceptional properties.',
+      serviceAreaId: serviceAreaMap['Materials'],
+      status: 'published',
+      submissionDate: new Date('2024-01-20'),
+      publicationDate: new Date('2024-02-15'),
+      tags: ['materials', 'concrete', 'durability'],
+      externalLinks: [{ title: 'Implementation Guide', url: 'https://example.com/uhpc-guide' }],
+      images: [{
+        title: 'UHPC Application',
+        url: 'https://via.placeholder.com/640x360?text=UHPC+Application',
+        alt: 'UHPC being applied to bridge components'
+      }],
+      submitter: {
+        name: 'Dr. Michael Lee',
+        email: 'mlee@example.com',
+        organization: 'Advanced Materials Research'
+      }
+    });
     
-    res.json({ message: 'Database seeded successfully' });
+    // Technologies waiting for evaluation
+    const technology3 = await Technology.create({
+      title: 'Self-Healing Concrete',
+      description: 'Innovative concrete with embedded bacteria that automatically repair cracks when they form.',
+      detailedInformation: '# Self-Healing Concrete\n\nThis technology embeds bacteria in concrete that activates when cracks form.',
+      serviceAreaId: serviceAreaMap['Materials'],
+      status: 'submitted',
+      submissionDate: new Date('2024-02-25'),
+      tags: ['materials', 'concrete', 'self-healing'],
+      externalLinks: [{ title: 'Research Paper', url: 'https://example.com/self-healing' }],
+      images: [{
+        title: 'Self-Healing Process',
+        url: 'https://via.placeholder.com/640x360?text=Self-Healing+Process',
+        alt: 'Microscopic view of self-healing concrete'
+      }],
+      submitter: {
+        name: 'Prof. Lisa Rodriguez',
+        email: 'lrodriguez@example.com',
+        organization: 'Sustainable Materials Research'
+      }
+    });
+    
+    const technology4 = await Technology.create({
+      title: 'Drone Bridge Inspection',
+      description: 'Advanced drone systems for comprehensive, efficient, and safe bridge inspections.',
+      detailedInformation: '# Drone Bridge Inspection\n\nDrones offer a safer alternative to traditional bridge inspection methods.',
+      serviceAreaId: serviceAreaMap['Condition Assessment/Monitoring'],
+      status: 'submitted',
+      submissionDate: new Date('2024-02-28'),
+      tags: ['inspection', 'drones', 'safety'],
+      externalLinks: [{ title: 'Case Study', url: 'https://example.com/drone-inspection' }],
+      images: [{
+        title: 'Inspection Drone',
+        url: 'https://via.placeholder.com/640x360?text=Inspection+Drone',
+        alt: 'Drone inspecting bridge structure'
+      }],
+      submitter: {
+        name: 'Alex Patel',
+        email: 'apatel@example.com',
+        organization: 'Advanced Inspection Tech'
+      }
+    });
+    
+    res.status(200).json({
+      message: 'Database seeded successfully',
+      data: {
+        serviceAreas: createdServiceAreas.length,
+        users: 3,
+        technologies: 4
+      }
+    });
   } catch (error) {
     console.error('Seed error:', error);
-    res.status(500).json({ message: 'Seeding failed', error: error.message });
+    res.status(500).json({ message: 'Error seeding database', error: error.message });
   }
 });
 
-// Serve static assets in production
-if (process.env.NODE_ENV === 'production') {
-  const buildPath = path.join(__dirname, 'build');
-  
-  app.use(express.static(buildPath));
-  
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(buildPath, 'index.html'));
-  });
-} else {
-  // For development/testing
-  app.get('/', (req, res) => {
-    res.send('API is running');
-  });
-}
+// Create a simple HTML file for the root route
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>ABTC API Server</title>
+      <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+      <style>
+        body { padding: 40px; }
+        pre { background: #f8f9fa; padding: 15px; border-radius: 5px; }
+        .endpoint { margin-bottom: 30px; }
+        .method { font-weight: bold; display: inline-block; width: 80px; }
+        .method-get { color: #0d6efd; }
+        .method-post { color: #198754; }
+        .method-put { color: #fd7e14; }
+        .method-delete { color: #dc3545; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1 class="mb-4">Advanced Bridge Technology Clearinghouse (ABTC) API</h1>
+        <p class="lead">This is the API server for the ABTC platform. Use the endpoints below to test the API functionality.</p>
+        
+        <div class="card mb-4">
+          <div class="card-header">
+            <h2 class="h5 mb-0">🧪 Test the API</h2>
+          </div>
+          <div class="card-body">
+            <p>You can use the button below to seed the database with sample data:</p>
+            <button id="seedBtn" class="btn btn-primary mb-3">Seed Database</button>
+            <div id="seedResult" class="alert alert-info d-none"></div>
+            
+            <hr>
+            
+            <h3 class="h5 mt-4">View Technologies</h3>
+            <button id="getTechnologiesBtn" class="btn btn-secondary">Fetch Technologies</button>
+            <div id="technologiesResult" class="mt-3"></div>
+            
+            <h3 class="h5 mt-4">Login</h3>
+            <form id="loginForm" class="mb-3">
+              <div class="mb-3">
+                <label for="email" class="form-label">Email:</label>
+                <input type="email" id="email" class="form-control" value="admin@abtc.org">
+              </div>
+              <div class="mb-3">
+                <label for="password" class="form-label">Password:</label>
+                <input type="password" id="password" class="form-control" value="AdminPass123">
+              </div>
+              <button type="submit" class="btn btn-success">Login</button>
+            </form>
+            <div id="loginResult" class="alert alert-info d-none"></div>
+          </div>
+        </div>
+        
+        <h2>API Endpoints</h2>
+        
+        <div class="endpoint">
+          <h3>Authentication</h3>
+          <p><span class="method method-post">POST</span> /api/auth/login</p>
+          <p><span class="method method-get">GET</span> /api/auth/me</p>
+        </div>
+        
+        <div class="endpoint">
+          <h3>Service Areas</h3>
+          <p><span class="method method-get">GET</span> /api/service-areas</p>
+        </div>
+        
+        <div class="endpoint">
+          <h3>Technologies</h3>
+          <p><span class="method method-get">GET</span> /api/technologies</p>
+          <p><span class="method method-get">GET</span> /api/technologies/:id</p>
+        </div>
+        
+        <div class="endpoint">
+          <h3>Database Seeding</h3>
+          <p><span class="method method-post">POST</span> /api/seed</p>
+        </div>
+      </div>
+      
+      <script>
+        document.getElementById('seedBtn').addEventListener('click', async () => {
+          const resultEl = document.getElementById('seedResult');
+          resultEl.textContent = 'Seeding database...';
+          resultEl.classList.remove('d-none', 'alert-danger');
+          resultEl.classList.add('alert-info');
+          
+          try {
+            const response = await fetch('/api/seed', {
+              method: 'POST'
+            });
+            
+            const data = await response.json();
+            
+            if (response.ok) {
+              resultEl.textContent = 'Database seeded successfully!';
+              resultEl.classList.remove('alert-info');
+              resultEl.classList.add('alert-success');
+            } else {
+              throw new Error(data.message || 'Failed to seed database');
+            }
+          } catch (error) {
+            resultEl.textContent = error.message;
+            resultEl.classList.remove('alert-info');
+            resultEl.classList.add('alert-danger');
+          }
+        });
+        
+        document.getElementById('getTechnologiesBtn').addEventListener('click', async () => {
+          const resultEl = document.getElementById('technologiesResult');
+          resultEl.innerHTML = '<div class="spinner-border" role="status"><span class="visually-hidden">Loading...</span></div>';
+          
+          try {
+            const response = await fetch('/api/technologies');
+            const data = await response.json();
+            
+            if (response.ok) {
+              let html = '<div class="table-responsive"><table class="table table-striped">';
+              html += '<thead><tr><th>Title</th><th>Service Area</th><th>Status</th><th>Submission Date</th></tr></thead>';
+              html += '<tbody>';
+              
+              data.technologies.forEach(tech => {
+                html += '<tr>';
+                html += '<td>' + tech.title + '</td>';
+                html += '<td>' + (tech.serviceAreaId ? tech.serviceAreaId.name : 'Unknown') + '</td>';
+                html += '<td>' + tech.status + '</td>';
+                html += '<td>' + new Date(tech.submissionDate).toLocaleDateString() + '</td>';
+                html += '</tr>';
+              });
+              
+              html += '</tbody></table></div>';
+              resultEl.innerHTML = html;
+            } else {
+              throw new Error(data.message || 'Failed to fetch technologies');
+            }
+          } catch (error) {
+            resultEl.innerHTML = '<div class="alert alert-danger">' + error.message + '</div>';
+          }
+        });
+        
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+          e.preventDefault();
+          
+          const email = document.getElementById('email').value;
+          const password = document.getElementById('password').value;
+          const resultEl = document.getElementById('loginResult');
+          
+          resultEl.textContent = 'Logging in...';
+          resultEl.classList.remove('d-none', 'alert-danger', 'alert-success');
+          resultEl.classList.add('alert-info');
+          
+          try {
+            const response = await fetch('/api/auth/login', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ email, password })
+            });
+            
+            const data = await response.json();
+            
+            if (response.ok) {
+              resultEl.textContent = 'Login successful! User: ' + data.user.name + ' (Role: ' + data.user.role + ')';
+              resultEl.classList.remove('alert-info');
+              resultEl.classList.add('alert-success');
+              localStorage.setItem('token', data.token);
+            } else {
+              throw new Error(data.message || 'Login failed');
+            }
+          } catch (error) {
+            resultEl.textContent = error.message;
+            resultEl.classList.remove('alert-info');
+            resultEl.classList.add('alert-danger');
+          }
+        });
+      </script>
+    </body>
+    </html>
+  `);
+});
 
 // Error handling middleware
 app.use((err, req, res, next) => {
