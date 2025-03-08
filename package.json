@@ -5,13 +5,10 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "build": "cd frontend && npm install && npm run build && cd .. && mkdir -p build && cp -r frontend/build/* build/",
-    "dev": "nodemon server.js",
-    "seed": "NODE_ENV=development node -e \"require('./server').seed()\"",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "nodemon server.js"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=14.0.0"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -20,8 +17,7 @@
     "express": "^4.18.2",
     "jsonwebtoken": "^9.0.0",
     "mongoose": "^7.0.3",
-    "morgan": "^1.10.0",
-    "path": "^0.12.7"
+    "morgan": "^1.10.0"
   },
   "devDependencies": {
     "nodemon": "^2.0.22"
